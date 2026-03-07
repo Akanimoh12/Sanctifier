@@ -112,7 +112,7 @@ impl VaultContract {
 
 fn bench_ast_parsing_and_rules(c: &mut Criterion) {
     let mut group = c.benchmark_group("Static Analysis Engine");
-    
+
     // Benchmark the initialization of the analyzer
     group.bench_function("Analyzer Initialization", |b| {
         b.iter(|| {
@@ -125,38 +125,30 @@ fn bench_ast_parsing_and_rules(c: &mut Criterion) {
     group.bench_function("Full AST Rule Execution", |b| {
         let config = SanctifyConfig::default();
         let analyzer = Analyzer::new(config);
-        
-        b.iter(|| {
-            analyzer.run_rules(COMPLEX_CONTRACT_PAYLOAD)
-        })
+
+        b.iter(|| analyzer.run_rules(COMPLEX_CONTRACT_PAYLOAD))
     });
 
     // Benchmark specific targeted rules
     group.bench_function("Auth Gaps Analysis", |b| {
         let config = SanctifyConfig::default();
         let analyzer = Analyzer::new(config);
-        
-        b.iter(|| {
-            analyzer.scan_auth_gaps(COMPLEX_CONTRACT_PAYLOAD)
-        })
+
+        b.iter(|| analyzer.scan_auth_gaps(COMPLEX_CONTRACT_PAYLOAD))
     });
 
     group.bench_function("Panic & Unwrap Analysis", |b| {
         let config = SanctifyConfig::default();
         let analyzer = Analyzer::new(config);
-        
-        b.iter(|| {
-            analyzer.scan_panics(COMPLEX_CONTRACT_PAYLOAD)
-        })
+
+        b.iter(|| analyzer.scan_panics(COMPLEX_CONTRACT_PAYLOAD))
     });
 
     group.bench_function("Ledger Size Analysis", |b| {
         let config = SanctifyConfig::default();
         let analyzer = Analyzer::new(config);
-        
-        b.iter(|| {
-            analyzer.analyze_ledger_size(COMPLEX_CONTRACT_PAYLOAD)
-        })
+
+        b.iter(|| analyzer.analyze_ledger_size(COMPLEX_CONTRACT_PAYLOAD))
     });
 
     group.finish();

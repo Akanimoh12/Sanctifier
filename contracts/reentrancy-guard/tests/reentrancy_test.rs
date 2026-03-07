@@ -1,7 +1,7 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, Env, testutils::Address as _};
 use reentrancy_guard::ReentrancyGuard;
+use soroban_sdk::{contract, contractimpl, testutils::Address as _, Env};
 
 #[contract]
 pub struct ProtectedContract;
@@ -30,7 +30,7 @@ fn test_reentrancy_protection() {
     let env = Env::default();
     let contract_id = env.register_contract(None, ProtectedContract);
     let client = ProtectedContractClient::new(&env, &contract_id);
-    
+
     client.malicious_reentry();
 }
 
@@ -39,7 +39,7 @@ fn test_normal_usage() {
     let env = Env::default();
     let contract_id = env.register_contract(None, ProtectedContract);
     let client = ProtectedContractClient::new(&env, &contract_id);
-    
+
     client.do_something();
     client.do_something(); // Sequential calls should work
 }

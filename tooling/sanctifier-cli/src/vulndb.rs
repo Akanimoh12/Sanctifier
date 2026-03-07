@@ -63,8 +63,14 @@ impl VulnDatabase {
 
             for mat in re.find_iter(source) {
                 let line = source[..mat.start()].matches('\n').count() + 1;
-                let line_start = source[..mat.start()].rfind('\n').map(|p| p + 1).unwrap_or(0);
-                let line_end = source[mat.end()..].find('\n').map(|p| mat.end() + p).unwrap_or(source.len());
+                let line_start = source[..mat.start()]
+                    .rfind('\n')
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                let line_end = source[mat.end()..]
+                    .find('\n')
+                    .map(|p| mat.end() + p)
+                    .unwrap_or(source.len());
                 let snippet = source[line_start..line_end].trim().to_string();
 
                 matches.push(VulnMatch {

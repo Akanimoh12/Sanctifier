@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::panic::catch_unwind;
 pub mod finding_codes;
 pub mod gas_estimator;
+pub mod gas_report;
 pub mod rules;
 pub mod smt;
 mod storage_collision;
@@ -89,7 +90,7 @@ pub enum UpgradeCategory {
 }
 
 /// Upgrade safety report.
-#[derive(Debug, Serialize, Clone, Default)]
+#[derive(Debug, Serialize, Clone)]
 pub struct UpgradeReport {
     pub findings: Vec<UpgradeFinding>,
     pub upgrade_mechanisms: Vec<String>,
@@ -110,10 +111,11 @@ impl UpgradeReport {
     }
 }
 
-impl Default for UpgradeReport {
-    fn default() -> Self {
-        Self::empty()
-    }
+
+struct UnhandledResultVisitor {
+    issues: Vec<UnhandledResultIssue>,
+    current_fn: Option<String>,
+    is_public_fn: bool,
 }
 
 #[allow(dead_code)]
@@ -269,16 +271,6 @@ impl Default for SanctifyConfig {
             strict_mode: false,
             custom_rules: vec![],
         }
-    }
-}
-
-fn with_panic_guard<T>(f: impl FnOnce() -> T) -> T
-where
-    T: Default,
-{
-    match panic::catch_unwind(AssertUnwindSafe(f)) {
-        Ok(v) => v,
-        Err(_) => T::default(),
     }
 }
 
@@ -745,52 +737,6 @@ impl Analyzer {
         warnings
     }
 
-    // ── Upgrade analysis ─────────────────────────────────────────────────────
-
-    pub fn analyze_upgrade_patterns(&self, source: &str) -> UpgradeReport {
-        with_panic_guard(|| self.analyze_upgrade_patterns_impl(source))
-    }
-
-    fn analyze_upgrade_patterns_impl(&self, source: &str) -> UpgradeReport {
-        let file = match parse_str::<File>(source) {
-            Ok(f) => f,
-            Err(_) => return UpgradeReport::empty(),
-        };
-
-        let mut report = UpgradeReport::empty();
-        for item in &file.items {
-            if let Item::Impl(i) = item {
-                for impl_item in &i.items {
-                    if let syn::ImplItem::Fn(f) = impl_item {
-                        let fn_name = f.sig.ident.to_string();
-                        if is_upgrade_or_admin_fn(&fn_name) {
-                            report.upgrade_mechanisms.push(fn_name.clone());
-                        }
-                        if is_init_fn(&fn_name) {
-                            report.init_functions.push(fn_name.clone());
-                        }
-                    }
-                }
-            }
-            if let Item::Enum(e) = item {
-                if has_contracttype(&e.attrs) {
-                    report.storage_types.push(e.ident.to_string());
-                }
-            }
-        }
-
-        // Heuristic for Governance finding as expected by test
-        report.findings.push(UpgradeFinding {
-            category: UpgradeCategory::Governance,
-            function_name: None,
-            location: "Contract".to_string(),
-            message: "Governance review recommended.".to_string(),
-            suggestion: "Ensure multi-sig or DAO control for upgrades.".to_string(),
-        });
-
-        report
-    }
-
     // ── Event Consistency and Optimization ──────────────────────────────────────
 
     fn extract_topics(line: &str) -> String {
@@ -1000,6 +946,20 @@ impl Analyzer {
         caller: &str,
         file_path: &str,
     ) -> Vec<ContractCallEdge> {
+        let file = match parse_str::<File>(source) {
+            Ok(f) => f,
+            Err(_) => return vec![],
+        };
+
+        let mut visitor = InvokeContractVisitor {
+            edges: Vec::new(),
+            caller: caller.to_string(),
+            file_path: file_path.to_string(),
+        };
+        visitor.visit_file(&file);
+        visitor.edges
+    }
+
     // ── Storage key collision detection (NEW) ─────────────────────────────────
 
     /// Scans for potential storage key collisions by analyzing constants,
@@ -1030,13 +990,6 @@ impl Analyzer {
             Err(_) => return vec![],
         };
 
-        let mut visitor = InvokeContractVisitor {
-            edges: Vec::new(),
-            caller: caller.to_string(),
-            file_path: file_path.to_string(),
-        };
-        visitor.visit_file(&file);
-        visitor.edges
         let mut visitor = UnhandledResultVisitor {
             issues: Vec::new(),
             current_fn: None,
@@ -1250,379 +1203,9 @@ impl<'ast> Visit<'ast> for InvokeContractVisitor {
 
 fn simplify_expr_string(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
-// ── EventVisitor ──────────────────────────────────────────────────────────────
-
-#[allow(dead_code)]
-struct EventVisitor {
-    issues: Vec<EventIssue>,
-    current_fn: Option<String>,
-    /// Maps event name -> number of topics found.
-    event_schemas: std::collections::HashMap<String, usize>,
 }
 
-impl<'ast> Visit<'ast> for EventVisitor {
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        let prev = self.current_fn.take();
-        self.current_fn = Some(node.sig.ident.to_string());
-        visit::visit_impl_item_fn(self, node);
-        self.current_fn = prev;
-    }
-
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        let prev = self.current_fn.take();
-        self.current_fn = Some(node.sig.ident.to_string());
-        visit::visit_item_fn(self, node);
-        self.current_fn = prev;
-    }
-
-    fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
-        let method_name = i.method.to_string();
-        if method_name == "publish" {
-            // Heuristic check for env.events().publish(topics, data)
-            if let syn::Expr::MethodCall(inner_m) = &*i.receiver {
-                if inner_m.method == "events" {
-                    if let Some(fn_name) = self.current_fn.as_ref().cloned() {
-                        self.analyze_publish_call(i, &fn_name);
-                    }
-                }
-            }
-        }
-        visit::visit_expr_method_call(self, i);
-    }
-}
-
-#[allow(dead_code)]
-impl EventVisitor {
-    fn analyze_publish_call(&mut self, i: &syn::ExprMethodCall, fn_name: &str) {
-        if i.args.len() < 2 {
-            return;
-        }
-        let topics_arg = &i.args[0];
-
-        // 1. Extract event name and topic count
-        let (event_name, topic_count) = match self.extract_event_info(topics_arg) {
-            Some(info) => info,
-            None => return,
-        };
-
-        // 2. Check for schema consistency
-        if let Some(&prev_count) = self.event_schemas.get(&event_name) {
-            if prev_count != topic_count {
-                self.issues.push(EventIssue {
-                    function_name: fn_name.to_string(),
-                    event_name: event_name.clone(),
-                    issue_type: EventIssueType::InconsistentSchema,
-                    message: format!(
-                        "Inconsistent topic count for event '{}': expected {}, found {}",
-                        event_name, prev_count, topic_count
-                    ),
-                    location: format!("{}:{}", fn_name, topics_arg.span().start().line),
-                });
-            }
-        } else {
-            self.event_schemas.insert(event_name.clone(), topic_count);
-        }
-
-        // 3. Check for optimizable topics (bare string literals)
-        self.check_optimizable_topics(topics_arg, fn_name, &event_name);
-    }
-
-    fn extract_event_info(&self, topics: &syn::Expr) -> Option<(String, usize)> {
-        match topics {
-            syn::Expr::Tuple(t) => {
-                if let Some(syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(s),
-                    ..
-                })) = t.elems.first()
-                {
-                    return Some((s.value(), t.elems.len()));
-                }
-            }
-            syn::Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Str(s),
-                ..
-            }) => {
-                return Some((s.value(), 1));
-            }
-            _ => {}
-        }
-        None
-    }
-
-    fn check_optimizable_topics(&mut self, topics: &syn::Expr, fn_name: &str, event_name: &str) {
-        let check_lit = |expr: &syn::Expr, issues: &mut Vec<EventIssue>| {
-            if let syn::Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Str(s),
-                ..
-            }) = expr
-            {
-                let val = s.value();
-                if val.len() <= 10 {
-                    issues.push(EventIssue {
-                        function_name: fn_name.to_string(),
-                        event_name: event_name.to_string(),
-                        issue_type: EventIssueType::OptimizableTopic,
-                        message: format!(
-                            "Topic \"{}\" can be optimized using `symbol_short!(\"{}\")`",
-                            val, val
-                        ),
-                        location: format!("{}:{}", fn_name, expr.span().start().line),
-                    });
-                }
-            }
-        };
-
-        match topics {
-            syn::Expr::Tuple(t) => {
-                for elem in &t.elems {
-                    check_lit(elem, &mut self.issues);
-                }
-            }
-            _ => check_lit(topics, &mut self.issues),
-        }
-    }
-}
-
-// ── UnsafeVisitor ─────────────────────────────────────────────────────────────
-
-struct UnsafeVisitor {
-    patterns: Vec<UnsafePattern>,
-}
-
-impl<'ast> Visit<'ast> for UnsafeVisitor {
-    fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
-        let method_name = i.method.to_string();
-        if method_name == "unwrap" || method_name == "expect" {
-            let pattern_type = if method_name == "unwrap" {
-                PatternType::Unwrap
-            } else {
-                PatternType::Expect
-            };
-            self.patterns.push(UnsafePattern {
-                pattern_type,
-                snippet: quote::quote!(#i).to_string(),
-                line: 0, // Simplified for now
-            });
-        }
-        visit::visit_expr_method_call(self, i);
-    }
-
-    fn visit_macro(&mut self, i: &'ast syn::Macro) {
-        if i.path.is_ident("panic") {
-            self.patterns.push(UnsafePattern {
-                pattern_type: PatternType::Panic,
-                snippet: quote::quote!(#i).to_string(),
-                line: i.path.span().start().line,
-            });
-        }
-        visit::visit_macro(self, i);
-    }
-}
-
-// ── SanctifiedGuard (runtime monitoring) ───────────────────────────────────────
-
-/// Error type for SanctifiedGuard runtime invariant violations.
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("invariant violation: {0}")]
-    InvariantViolation(String),
-}
-
-/// Trait for runtime monitoring. Implement this to enforce invariants
-/// on your contract state. The foundation for runtime monitoring.
-pub trait SanctifiedGuard {
-    /// Verifies that contract invariants hold in the current environment.
-    /// Returns `Ok(())` if all invariants hold, or `Err` with a violation message.
-    fn check_invariant(&self, env: &Env) -> Result<(), Error>;
-}
-
-// ── ArithVisitor ──────────────────────────────────────────────────────────────
-
-struct ArithVisitor {
-    issues: Vec<ArithmeticIssue>,
-    /// Name of the function currently being visited.
-    current_fn: Option<String>,
-    /// De-duplicates issues: one per (function_name, operator) pair.
-    seen: HashSet<(String, String)>,
-}
-
-impl ArithVisitor {
-    /// Returns `(operator_str, suggestion_text)` for overflow-prone binary ops,
-    /// or `None` for operators that cannot overflow (comparisons, bitwise, etc).
-    fn classify_op(op: &syn::BinOp) -> Option<(&'static str, &'static str)> {
-        match op {
-            syn::BinOp::Add(_) => Some((
-                "+",
-                "Use `.checked_add(rhs)` or `.saturating_add(rhs)` to handle overflow",
-            )),
-            syn::BinOp::Sub(_) => Some((
-                "-",
-                "Use `.checked_sub(rhs)` or `.saturating_sub(rhs)` to handle underflow",
-            )),
-            syn::BinOp::Mul(_) => Some((
-                "*",
-                "Use `.checked_mul(rhs)` or `.saturating_mul(rhs)` to handle overflow",
-            )),
-            syn::BinOp::AddAssign(_) => Some((
-                "+=",
-                "Replace `a += b` with `a = a.checked_add(b).expect(\"overflow\")`",
-            )),
-            syn::BinOp::SubAssign(_) => Some((
-                "-=",
-                "Replace `a -= b` with `a = a.checked_sub(b).expect(\"underflow\")`",
-            )),
-            syn::BinOp::MulAssign(_) => Some((
-                "*=",
-                "Replace `a *= b` with `a = a.checked_mul(b).expect(\"overflow\")`",
-            )),
-            _ => None,
-        }
-    }
-}
-
-impl<'ast> Visit<'ast> for ArithVisitor {
-    /// Track the current function when descending into an impl method.
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        let prev = self.current_fn.take();
-        self.current_fn = Some(node.sig.ident.to_string());
-        visit::visit_impl_item_fn(self, node);
-        self.current_fn = prev;
-    }
-
-    /// Also handle top-level `fn` items (helper functions outside impls).
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        let prev = self.current_fn.take();
-        self.current_fn = Some(node.sig.ident.to_string());
-        visit::visit_item_fn(self, node);
-        self.current_fn = prev;
-    }
-
-    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
-        if let Some(fn_name) = self.current_fn.clone() {
-            if let Some((op_str, suggestion)) = Self::classify_op(&node.op) {
-                // Skip concatenation of string literals (false positive for `+`)
-                if !is_string_literal(&node.left) && !is_string_literal(&node.right) {
-                    let key = (fn_name.clone(), op_str.to_string());
-                    if !self.seen.contains(&key) {
-                        self.seen.insert(key);
-                        // Line number from the left operand's span
-                        let line = node.left.span().start().line;
-                        self.issues.push(ArithmeticIssue {
-                            function_name: fn_name.clone(),
-                            operation: op_str.to_string(),
-                            suggestion: suggestion.to_string(),
-                            location: format!("{}:{}", fn_name, line),
-                        });
-                    }
-                }
-            }
-        }
-        // Continue descending so nested binary ops are also checked
-        visit::visit_expr_binary(self, node);
-    }
-}
-
-/// Returns `true` if the expression is a string literal — used to avoid
-/// false-positives on `+` for string concatenation (rare in no_std Soroban
-/// but included for correctness).
-fn is_string_literal(expr: &syn::Expr) -> bool {
-    matches!(
-        expr,
-        syn::Expr::Lit(syn::ExprLit {
-            lit: syn::Lit::Str(_),
-            ..
-        })
-    )
-}
-
-struct UnhandledResultVisitor {
-    issues: Vec<UnhandledResultIssue>,
-    current_fn: Option<String>,
-    is_public_fn: bool,
-}
-
-impl UnhandledResultVisitor {
-    fn is_result_type(ty: &Type) -> bool {
-        if let Type::Path(tp) = ty {
-            if let Some(seg) = tp.path.segments.last() {
-                return seg.ident == "Result";
-            }
-        }
-        false
-    }
-
-    fn is_result_returning_fn(sig: &syn::Signature) -> bool {
-        if let syn::ReturnType::Type(_, ty) = &sig.output {
-            Self::is_result_type(ty)
-        } else {
-            false
-        }
-    }
-
-    fn is_handled(expr: &syn::Expr) -> bool {
-        match expr {
-            syn::Expr::Try(_) => true,
-            syn::Expr::Match(_) => true,
-            syn::Expr::If(e) => {
-                if let syn::Expr::Try(_) = &*e.cond {
-                    return true;
-                }
-                if let Some((_, else_expr)) = &e.else_branch {
-                    Self::is_handled(else_expr);
-                }
-                false
-            }
-            syn::Expr::Let(e) => {
-                if let syn::Expr::Try(_) = &*e.expr {
-                    return true;
-                }
-                false
-            }
-            syn::Expr::MethodCall(m) => {
-                let method = m.method.to_string();
-                matches!(
-                    method.as_str(),
-                    "unwrap"
-                        | "expect"
-                        | "unwrap_or"
-                        | "unwrap_or_else"
-                        | "unwrap_or_default"
-                        | "ok"
-                        | "err"
-                        | "is_ok"
-                        | "is_err"
-                        | "map"
-                        | "map_err"
-                        | "and_then"
-                        | "or_else"
-                        | "unwrap_unchecked"
-                        | "expect_unchecked"
-                )
-            }
-            syn::Expr::Assign(a) => Self::is_handled(&a.right),
-            syn::Expr::Call(c) => {
-                if let syn::Expr::Path(p) = &*c.func {
-                    if let Some(seg) = p.path.segments.last() {
-                        if seg.ident == "Ok" || seg.ident == "Err" {
-                            return true;
-                        }
-                    }
-                }
-                false
-            }
-            _ => false,
-        }
-    }
-
-    fn expr_to_string(expr: &syn::Expr) -> String {
-        let s = quote::quote!(#expr).to_string();
-        if s.len() > 80 {
-            format!("{}...", &s[..77])
-        } else {
-            s
-        }
-    }
-}
+// ── EventVisitor (stubs/helpers moved) ──────────────────────────────────────
 
 impl<'ast> Visit<'ast> for UnhandledResultVisitor {
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
@@ -1686,7 +1269,7 @@ impl UnhandledResultVisitor {
                     if let Some(fn_name) = &self.current_fn {
                         let line = expr.span().start().line;
                         self.issues.push(UnhandledResultIssue {
-                            function_name: fn_name.clone(),
+                            function_name: fn_name.to_string(),
                             call_expression: Self::expr_to_string(expr),
                             message: "Result returned from function call is not handled. Use ?, match, or .unwrap()/.expect() to handle the Result.".to_string(),
                             location: format!("{}:{}", fn_name, line),
@@ -1812,10 +1395,7 @@ mod tests {
 
     #[test]
     fn test_analyze_with_limit() {
-        let config = SanctifyConfig {
-            ledger_limit: 50,
-
-        };
+        let config = SanctifyConfig { ledger_limit: 50 };
         let analyzer = Analyzer::new(config);
         let source = r#"
             #[contracttype]
@@ -2858,5 +2438,3 @@ mod tests {
         assert!(collisions.is_empty());
     }
 }
-pub mod gas_estimator;
-pub mod gas_report;

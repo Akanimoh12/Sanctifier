@@ -55,10 +55,13 @@ impl<'a> ReentrancyGuard<'a> {
     pub fn enter(&self) {
         let status: u32 = self.env.storage().instance().get(&GUARD_KEY).unwrap_or(0);
         let current = GuardStatus::from_u32(status);
-        
+
         match enter_pure(current) {
             Ok(new_status) => {
-                self.env.storage().instance().set(&GUARD_KEY, &(new_status as u32));
+                self.env
+                    .storage()
+                    .instance()
+                    .set(&GUARD_KEY, &(new_status as u32));
             }
             Err(msg) => panic!("{}", msg),
         }
@@ -67,7 +70,10 @@ impl<'a> ReentrancyGuard<'a> {
     /// Exit a reentrancy-protected section.
     pub fn exit(&self) {
         let unlocked = exit_pure();
-        self.env.storage().instance().set(&GUARD_KEY, &(unlocked as u32));
+        self.env
+            .storage()
+            .instance()
+            .set(&GUARD_KEY, &(unlocked as u32));
     }
 }
 
@@ -106,7 +112,11 @@ mod verification {
         // We model status as u32 to simulate kani::any() more broadly if needed,
         // but here we can just use the enum variant logic.
         let is_locked: bool = kani::any();
-        let current = if is_locked { GuardStatus::Locked } else { GuardStatus::Unlocked };
+        let current = if is_locked {
+            GuardStatus::Locked
+        } else {
+            GuardStatus::Unlocked
+        };
 
         let result = enter_pure(current);
 
