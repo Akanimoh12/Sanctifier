@@ -107,6 +107,10 @@ sanctifier analyze . --format json > sanctifier-report.json
 sanctifier badge --report sanctifier-report.json --svg-output badges/sanctifier-security.svg --markdown-output badges/sanctifier-security.md
 ```
 
+## Case Studies
+Sanctifier is now benchmarked against the official Soroban examples repository.
+See [docs/case-studies/soroban-examples.md](docs/case-studies/soroban-examples.md) for the current baseline results and follow-up precision work.
+
 ## 🤝 Contributing
 We welcome contributions from the Stellar community! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
 
