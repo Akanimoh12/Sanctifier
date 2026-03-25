@@ -39,6 +39,8 @@ pub mod rules;
 /// SEP-41 token-interface verification.
 pub mod sep41;
 /// Z3 SMT solver integration for formal verification.
+/// Only available when the `smt` feature is enabled (default).
+#[cfg(feature = "smt")]
 pub mod smt;
 /// Storage-key collision detection (internal).
 mod storage_collision;
@@ -211,6 +213,10 @@ impl FunctionSecuritySummary {
     }
 }
 
+fn is_reserved_soroban_entrypoint(fn_name: &str) -> bool {
+    matches!(fn_name, "__constructor" | "__check_auth")
+}
+
 impl<'ast> Visit<'ast> for UnsafeVisitor {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         let method_name = node.method.to_string();
@@ -247,6 +253,14 @@ impl<'ast> Visit<'ast> for UnsafeVisitor {
 fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
     attrs.iter().any(|attr| {
         matches!(&attr.meta, Meta::Path(path) if path.is_ident(name) || path.segments.iter().any(|s| s.ident == name))
+    })
+}
+
+/// Returns `true` when `attrs` contains `#[cfg(test)]`.
+fn is_cfg_test_attrs(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        a.path().is_ident("cfg")
+            && quote::quote!(#a).to_string().contains("test")
     })
 }
 
@@ -581,10 +595,13 @@ impl Analyzer {
     }
 
     /// Run lightweight formal-verification checks via Z3.
+    /// Only available when the `smt` feature is enabled (default).
+    #[cfg(feature = "smt")]
     pub fn verify_smt_invariants(&self, source: &str) -> Vec<smt::SmtInvariantIssue> {
         with_panic_guard(|| self.verify_smt_invariants_impl(source))
     }
 
+    #[cfg(feature = "smt")]
     fn verify_smt_invariants_impl(&self, source: &str) -> Vec<smt::SmtInvariantIssue> {
         let file = match parse_str::<File>(source) {
             Ok(f) => f,
@@ -662,6 +679,9 @@ impl Analyzer {
                     if let syn::ImplItem::Fn(f) = impl_item {
                         if let syn::Visibility::Public(_) = f.vis {
                             let fn_name = f.sig.ident.to_string();
+                            if is_reserved_soroban_entrypoint(&fn_name) {
+                                continue;
+                            }
                             let mut summary = FunctionSecuritySummary::default();
                             self.check_fn_body(&f.block, &mut summary);
                             if summary.has_sensitive_action() && !summary.has_auth {
@@ -691,13 +711,38 @@ impl Analyzer {
 
         let mut issues = Vec::new();
         for item in &file.items {
-            if let Item::Impl(i) = item {
-                for impl_item in &i.items {
-                    if let syn::ImplItem::Fn(f) = impl_item {
-                        let fn_name = f.sig.ident.to_string();
-                        self.check_fn_panics(&f.block, &fn_name, &mut issues);
+            match item {
+                Item::Impl(i) => {
+                    if is_cfg_test_attrs(&i.attrs) {
+                        continue;
+                    }
+                    for impl_item in &i.items {
+                        if let syn::ImplItem::Fn(f) = impl_item {
+                            if has_attr(&f.attrs, "test") {
+                                continue;
+                            }
+                            let fn_name = f.sig.ident.to_string();
+                            self.check_fn_panics(&f.block, &fn_name, &mut issues);
+                        }
                     }
                 }
+                Item::Mod(m) => {
+                    if is_cfg_test_attrs(&m.attrs) {
+                        continue;
+                    }
+                    if let Some((_, items)) = &m.content {
+                        for item in items {
+                            if let Item::Fn(f) = item {
+                                if has_attr(&f.attrs, "test") {
+                                    continue;
+                                }
+                                let fn_name = f.sig.ident.to_string();
+                                self.check_fn_panics(&f.block, &fn_name, &mut issues);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -1090,6 +1135,8 @@ impl Analyzer {
             issues: Vec::new(),
             current_fn: None,
             seen: HashSet::new(),
+            index_depth: 0,
+            test_mod_depth: 0,
         };
         visitor.visit_file(&file);
         visitor.issues
@@ -1411,6 +1458,7 @@ fn is_external_contract_method_call(method_call: &syn::ExprMethodCall) -> bool {
     }
 
     receiver_looks_like_external_client(&method_call.receiver)
+        && !method_looks_read_only(&method_call.method.to_string())
 }
 
 fn receiver_looks_like_external_client(expr: &syn::Expr) -> bool {
@@ -1454,6 +1502,13 @@ fn path_looks_like_client_constructor(path: &syn::Path) -> bool {
 fn ident_looks_like_client(ident: &str) -> bool {
     let lower = ident.to_lowercase();
     lower.ends_with("client") || lower.ends_with("_client")
+}
+
+fn method_looks_read_only(method_name: &str) -> bool {
+    matches!(method_name, "balance" | "paused" | "allowance" | "decimals" | "name" | "symbol")
+        || method_name.starts_with("get_")
+        || method_name.starts_with("is_")
+        || method_name.starts_with("has_")
 }
 
 // ── EventVisitor (stubs/helpers moved) ──────────────────────────────────────
@@ -1520,11 +1575,11 @@ impl UnhandledResultVisitor {
                     if let Some(fn_name) = &self.current_fn {
                         let line = expr.span().start().line;
                         self.issues.push(UnhandledResultIssue {
-                            function_name: fn_name.to_string(),
-                            call_expression: Self::expr_to_string(expr),
-                            message: "Result returned from function call is not handled. Use ?, match, or .unwrap()/.expect() to handle the Result.".to_string(),
-                            location: format!("{}:{}", fn_name, line),
-                        });
+                        function_name: fn_name.to_string(),
+                        call_expression: Self::expr_to_string(expr),
+                        message: "Result returned from function call is not handled. Use ?, match, or .unwrap()/.expect() to handle the Result.".to_string(),
+                        location: format!("{}:{}", fn_name, line),
+                    });
                     }
                 }
                 for arg in &call.args {
@@ -1532,9 +1587,10 @@ impl UnhandledResultVisitor {
                 }
             }
             syn::Expr::MethodCall(m) => {
-                if !Self::is_handled(expr) {
-                    self.check_expr_for_unhandled_result(&m.receiver, fn_returns_result);
+                if Self::is_handled(expr) {
+                    return;
                 }
+                self.check_expr_for_unhandled_result(&m.receiver, fn_returns_result);
                 for arg in &m.args {
                     self.check_expr_for_unhandled_result(arg, fn_returns_result);
                 }
@@ -1587,6 +1643,24 @@ impl UnhandledResultVisitor {
                     self.check_expr_for_unhandled_result(expr, true);
                 }
             }
+            syn::Expr::Path(_) => {}
+            syn::Expr::Lit(_) => {}
+            syn::Expr::Field(f) => {
+                self.check_expr_for_unhandled_result(&f.base, fn_returns_result);
+            }
+            syn::Expr::Index(i) => {
+                self.check_expr_for_unhandled_result(&i.expr, fn_returns_result);
+                self.check_expr_for_unhandled_result(&i.index, fn_returns_result);
+            }
+            syn::Expr::Reference(r) => {
+                self.check_expr_for_unhandled_result(&r.expr, fn_returns_result);
+            }
+            syn::Expr::Unary(u) => {
+                self.check_expr_for_unhandled_result(&u.expr, fn_returns_result);
+            }
+            syn::Expr::Cast(c) => {
+                self.check_expr_for_unhandled_result(&c.expr, fn_returns_result);
+            }
             _ => {}
         }
     }
@@ -1601,7 +1675,28 @@ impl UnhandledResultVisitor {
         if let syn::Expr::Path(p) = &*call.func {
             if let Some(seg) = p.path.segments.last() {
                 let name = seg.ident.to_string();
-                return !matches!(name.as_str(), "Ok" | "Err" | "Some" | "None" | "panic");
+                if matches!(name.as_str(), "Ok" | "Err" | "Some" | "None" | "panic") {
+                    return false;
+                }
+                if matches!(
+                    name.as_str(),
+                    "assert"
+                        | "assert_eq"
+                        | "assert_ne"
+                        | "debug_assert"
+                        | "debug_assert_eq"
+                        | "debug_assert_ne"
+                        | "println"
+                        | "print"
+                        | "eprintln"
+                        | "eprint"
+                        | "format"
+                        | "vec"
+                        | "panic"
+                ) {
+                    return false;
+                }
+                return true;
             }
         }
         false
@@ -1641,6 +1736,11 @@ impl UnhandledResultVisitor {
                         | "or_else"
                         | "unwrap_unchecked"
                         | "expect_unchecked"
+                        | "as_ref"
+                        | "as_mut"
+                        | "clone"
+                        | "inspect"
+                        | "inspect_err"
                 )
             }
             syn::Expr::Assign(a) => Self::is_handled(&a.right),
@@ -1654,6 +1754,7 @@ impl UnhandledResultVisitor {
                 }
                 false
             }
+            syn::Expr::Block(_) => true,
             _ => false,
         }
     }
@@ -1882,6 +1983,56 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_auth_gaps_ignores_reserved_soroban_entrypoints() {
+        let analyzer = Analyzer::new(SanctifyConfig::default());
+        let source = r#"
+            #[contractimpl]
+            impl AccountContract {
+                pub fn __constructor(env: Env, admin: Address) {
+                    env.storage().instance().set(&symbol_short!("admin"), &admin);
+                }
+
+                pub fn reset_admin(env: Env, admin: Address) {
+                    env.storage().instance().set(&symbol_short!("admin"), &admin);
+                }
+            }
+
+            #[contractimpl(contracttrait)]
+            impl CustomAccountInterface for AccountContract {
+                pub fn __check_auth(env: Env, payload: BytesN<32>) {
+                    env.storage().temporary().set(&payload, &true);
+                }
+            }
+        "#;
+
+        let gaps = analyzer.scan_auth_gaps(source);
+        assert_eq!(gaps, vec!["reset_admin".to_string()]);
+    }
+
+    #[test]
+    fn test_scan_auth_gaps_ignores_read_only_external_client_calls() {
+        let analyzer = Analyzer::new(SanctifyConfig::default());
+        let source = r#"
+            #[contractimpl]
+            impl Pool {
+                pub fn get_balance(env: Env, token: Address) -> i128 {
+                    let client = token::Client::new(&env, &token);
+                    client.balance(&env.current_contract_address())
+                }
+
+                pub fn forward_transfer(env: Env, token: Address, to: Address, amount: i128) {
+                    let client = token::Client::new(&env, &token);
+                    client.transfer(&env.current_contract_address(), &to, &amount);
+                }
+            }
+        "#;
+
+        let gaps = analyzer.scan_auth_gaps(source);
+        assert_eq!(gaps, vec!["forward_transfer".to_string()]);
+    }
+
+    #[test]
+    #[cfg(feature = "smt")]
     fn test_verify_smt_invariants_reports_external_contract_boundaries() {
         let analyzer = Analyzer::new(SanctifyConfig::default());
         let source = r#"
@@ -2371,6 +2522,154 @@ mod tests {
         let source = "this is not valid rust";
         let issues = analyzer.scan_unhandled_results(source);
         assert_eq!(issues.len(), 0, "{:?}", issues);
+    }
+
+    #[test]
+    fn test_unhandled_result_assert_macro() {
+        let analyzer = Analyzer::new(SanctifyConfig::default());
+        let source = r#"
+fn returns_result() -> Result<u32, Error> { Ok(42) }
+
+#[contractimpl]
+impl MyContract {
+    pub fn test_fn(env: Env) {
+        assert!(true);
+        assert_eq!(1, 1);
+        assert_ne!(1, 2);
+        debug_assert!(true);
+        println!("test");
+        format!("test");
+    }
+}
+"#;
+        let issues = analyzer.scan_unhandled_results(source);
+        assert_eq!(
+            issues.len(),
+            0,
+            "assert/print macros should not be flagged as unhandled results: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_unhandled_result_fluent_builder() {
+        let analyzer = Analyzer::new(SanctifyConfig::default());
+        let source = r#"
+struct Builder { val: u32 }
+impl Builder {
+    fn with_value(mut self, v: u32) -> Self { self.val = v; self }
+}
+
+#[contractimpl]
+impl MyContract {
+    pub fn build(env: Env) -> u32 {
+        Builder { val: 0 }
+            .with_value(1)
+            .with_value(2)
+    }
+}
+"#;
+        let issues = analyzer.scan_unhandled_results(source);
+        assert_eq!(
+            issues.len(),
+            0,
+            "fluent builder should not be flagged: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_unhandled_result_assignment() {
+        let analyzer = Analyzer::new(SanctifyConfig::default());
+        let source = r#"
+fn returns_result() -> Result<u32, Error> { Ok(42) }
+
+#[contractimpl]
+impl MyContract {
+    pub fn test_fn(env: Env) {
+        let result = returns_result();
+        let _ = returns_result();
+    }
+}
+"#;
+        let issues = analyzer.scan_unhandled_results(source);
+        assert_eq!(
+            issues.len(),
+            2,
+            "assignment without handling should be flagged: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_unhandled_result_block_expression() {
+        let analyzer = Analyzer::new(SanctifyConfig::default());
+        let source = r#"
+fn returns_result() -> Result<u32, Error> { Ok(42) }
+
+#[contractimpl]
+impl MyContract {
+    pub fn test_fn(env: Env) -> u32 {
+        {
+            let x = 1;
+            x + 1
+        }
+    }
+}
+"#;
+        let issues = analyzer.scan_unhandled_results(source);
+        assert_eq!(
+            issues.len(),
+            0,
+            "block expressions should not be flagged: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_unhandled_result_inspect() {
+        let analyzer = Analyzer::new(SanctifyConfig::default());
+        let source = r#"
+fn returns_result() -> Result<u32, Error> { Ok(42) }
+
+#[contractimpl]
+impl MyContract {
+    pub fn test_fn(env: Env) -> u32 {
+        returns_result()
+            .inspect(|v| println!("Got {}", v))
+            .unwrap()
+    }
+}
+"#;
+        let issues = analyzer.scan_unhandled_results(source);
+        assert_eq!(
+            issues.len(),
+            0,
+            "inspect should be recognized as handled: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_unhandled_result_private_fn_not_flagged() {
+        let analyzer = Analyzer::new(SanctifyConfig::default());
+        let source = r#"
+fn returns_result() -> Result<u32, Error> { Ok(42) }
+
+#[contractimpl]
+impl MyContract {
+    fn private_fn(env: Env) {
+        returns_result();
+    }
+}
+"#;
+        let issues = analyzer.scan_unhandled_results(source);
+        assert_eq!(
+            issues.len(),
+            0,
+            "private function unhandled results should not be flagged: {:?}",
+            issues
+        );
     }
 
     #[test]

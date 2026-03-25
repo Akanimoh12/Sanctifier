@@ -42,35 +42,46 @@ pub struct AnalyzeArgs {
 
 /// All findings produced by analysing a single `.rs` file.
 #[derive(Default)]
-struct FileAnalysisResult {
-    file_path: String,
-    collisions: Vec<sanctifier_core::StorageCollisionIssue>,
-    size_warnings: Vec<sanctifier_core::SizeWarning>,
-    unsafe_patterns: Vec<sanctifier_core::UnsafePattern>,
-    auth_gaps: Vec<String>,
-    panic_issues: Vec<sanctifier_core::PanicIssue>,
-    arithmetic_issues: Vec<sanctifier_core::ArithmeticIssue>,
-    custom_matches: Vec<sanctifier_core::CustomRuleMatch>,
-    vuln_matches: Vec<VulnMatch>,
-    event_issues: Vec<sanctifier_core::EventIssue>,
-    unhandled_results: Vec<sanctifier_core::UnhandledResultIssue>,
-    upgrade_reports: Vec<sanctifier_core::UpgradeReport>,
-    smt_issues: Vec<sanctifier_core::smt::SmtInvariantIssue>,
-    sep41_checked_contracts: Vec<String>,
-    sep41_issues: Vec<sanctifier_core::Sep41Issue>,
-    timed_out: bool,
+pub(crate) struct FileAnalysisResult {
+    pub(crate) file_path: String,
+    pub(crate) collisions: Vec<sanctifier_core::StorageCollisionIssue>,
+    pub(crate) size_warnings: Vec<sanctifier_core::SizeWarning>,
+    pub(crate) unsafe_patterns: Vec<sanctifier_core::UnsafePattern>,
+    pub(crate) auth_gaps: Vec<String>,
+    pub(crate) panic_issues: Vec<sanctifier_core::PanicIssue>,
+    pub(crate) arithmetic_issues: Vec<sanctifier_core::ArithmeticIssue>,
+    pub(crate) custom_matches: Vec<sanctifier_core::CustomRuleMatch>,
+    pub(crate) vuln_matches: Vec<VulnMatch>,
+    pub(crate) event_issues: Vec<sanctifier_core::EventIssue>,
+    pub(crate) unhandled_results: Vec<sanctifier_core::UnhandledResultIssue>,
+    pub(crate) upgrade_reports: Vec<sanctifier_core::UpgradeReport>,
+    pub(crate) smt_issues: Vec<sanctifier_core::smt::SmtInvariantIssue>,
+    pub(crate) sep41_checked_contracts: Vec<String>,
+    pub(crate) sep41_issues: Vec<sanctifier_core::Sep41Issue>,
+    pub(crate) timed_out: bool,
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 pub fn exec(args: AnalyzeArgs) -> anyhow::Result<()> {
-    let path = &args.path;
+    let mut path = args.path.clone();
+    
+    // Normalize path separators: ensure backslashes provided by users familiar with Windows 
+    // are converted to forward slashes on Unix systems to allow cross-platform path strings.
+    #[cfg(not(windows))]
+    {
+        let s = path.to_string_lossy();
+        if s.contains('\\') {
+            path = PathBuf::from(s.replace('\\', "/"));
+        }
+    }
+
     let format = &args.format;
     let _limit = args.limit;
     let is_json = format == "json";
     let timeout_secs = args.timeout;
 
-    if !is_soroban_project(path) {
+    if !is_soroban_project(&path) {
         if is_json {
             let err = serde_json::json!({
                 "error": format!("{:?} is not a valid Soroban project", path),
@@ -90,7 +101,7 @@ pub fn exec(args: AnalyzeArgs) -> anyhow::Result<()> {
     info!(target: "sanctifier", path = %path.display(), "Valid Soroban project found");
     info!(target: "sanctifier", path = %path.display(), "Analyzing contract");
 
-    let mut config = load_config(path);
+    let mut config = load_config(&path);
     config.ledger_limit = args.limit;
     let analyzer = Arc::new(Analyzer::new(config));
 
@@ -117,7 +128,7 @@ pub fn exec(args: AnalyzeArgs) -> anyhow::Result<()> {
 
     // ── Phase 1: collect all .rs file paths ──────────────────────────────
     let rs_files = if path.is_dir() {
-        collect_rs_files(path, &analyzer.config.ignore_paths)
+        collect_rs_files(&path, &analyzer.config.ignore_paths)
     } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
         vec![path.clone()]
     } else {
@@ -628,9 +639,83 @@ pub fn exec(args: AnalyzeArgs) -> anyhow::Result<()> {
 
 // ── Analyse one file (runs inside thread / rayon task) ───────────────────────
 
-fn analyze_single_file(
+pub(crate) fn analyze_single_file(
     analyzer: &Analyzer,
 
+    let mut up = analyzer.analyze_upgrade_patterns(content);
+    for f in &mut up.findings {
+        f.location = format!("{}:{}", file_name, f.location);
+    }
+    res.upgrade_reports.push(up);
+
+    let mut smt = analyzer.verify_smt_invariants(content);
+    for i in &mut smt {
+        i.location = format!("{}:{}", file_name, i.location);
+    }
+    res.smt_issues = smt;
+
+    let sep41_report = analyzer.verify_sep41_interface(content);
+    if sep41_report.candidate {
+        res.sep41_checked_contracts.push(file_name.to_string());
+        for mut issue in sep41_report.issues {
+            issue.location = format!("{}:{}", file_name, issue.location);
+            res.sep41_issues.push(issue);
+        }
+    }
+
+    res
+}
+
+// ── Per-file timeout wrapper ─────────────────────────────────────────────────
+
+/// Run `f` on a dedicated OS thread with an optional deadline.
+/// Returns `None` if the deadline elapses before `f` completes.
+pub(crate) fn run_with_timeout<F, R>(timeout: Option<Duration>, f: F) -> Option<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    match timeout {
+        None => Some(f()),
+        Some(dur) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = f();
+                let _ = tx.send(result);
+            });
+            rx.recv_timeout(dur).ok()
+        }
+    }
+}
+
+// ── Recursive file collection ────────────────────────────────────────────────
+
+/// Walk `dir` recursively, returning all `.rs` file paths while honouring
+/// `ignore_paths`.
+pub(crate) fn collect_rs_files(dir: &Path, ignore_paths: &[String]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let ignore_patterns: Vec<PathBuf> = ignore_paths.iter().map(PathBuf::from).collect();
+    collect_rs_files_inner(dir, &ignore_patterns, &mut out);
+    out
+}
+
+fn collect_rs_files_inner(dir: &Path, ignore_patterns: &[PathBuf], out: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let is_ignored = ignore_patterns.iter().any(|p| path.ends_with(p));
+            if !is_ignored {
+                collect_rs_files_inner(&path, ignore_patterns, out);
+            }
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -643,7 +728,7 @@ fn chrono_timestamp() -> String {
     format!("{}", secs)
 }
 
-fn load_config(path: &Path) -> SanctifyConfig {
+pub(crate) fn load_config(path: &Path) -> SanctifyConfig {
     let mut current = if path.is_file() {
         path.parent()
             .map(|p| p.to_path_buf())
@@ -668,7 +753,7 @@ fn load_config(path: &Path) -> SanctifyConfig {
     SanctifyConfig::default()
 }
 
-fn is_soroban_project(path: &Path) -> bool {
+pub(crate) fn is_soroban_project(path: &Path) -> bool {
     // Basic heuristics for tests.
     if path.extension().and_then(|s| s.to_str()) == Some("rs") {
         return true;
