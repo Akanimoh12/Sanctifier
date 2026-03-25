@@ -2144,6 +2144,7 @@ dependencies = [
 name = "reentrancy-guard"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "soroban-sdk",
 ]
 
